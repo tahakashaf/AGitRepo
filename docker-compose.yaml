@@ -1,0 +1,172 @@
+version: '3.7'
+
+x-common:
+  &common
+  image: apache/airflow:2.5.0
+  user: "${AIRFLOW_UID}:0"
+  env_file:
+    - .env
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+
+x-depends-on:
+  &depends-on
+  depends_on:
+    postgres:
+      condition: service_healthy
+    airflow-init:
+      condition: service_completed_successfully
+
+volumes:
+  minio-data:
+    driver: local
+  mariadb-data:
+    driver: local
+  jupyter-data:
+    driver: local
+
+networks:
+  mendix-network:
+    driver: bridge
+
+services:
+  minio:
+    image: minio/minio:latest
+    ports:
+      - '9000:9000'
+      - '9090:9090'
+    volumes:
+      - './minio_data:/data'
+    env_file:
+      - .env
+    networks:
+      - mendix-network
+    command: server --console-address ":9090" /data
+
+  postgres:
+    image: postgres:13
+    container_name: postgres
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-U", "airflow" ]
+      interval: 5s
+      retries: 5
+    env_file:
+      - .env
+    networks:
+      - mendix-network
+
+  scheduler:
+    <<: *common
+    <<: *depends-on
+    container_name: airflow-scheduler
+    command: scheduler
+    restart: on-failure
+    ports:
+      - "8793:8793"
+    networks:
+      - mendix-network
+
+  webserver:
+    <<: *common
+    <<: *depends-on
+    container_name: airflow-webserver
+    restart: always
+    command: webserver
+    ports:
+      - "8080:8080"
+    networks:
+      - mendix-network
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "--fail",
+          "http://localhost:8080/health"
+        ]
+      interval: 30s
+      timeout: 30s
+      retries: 5
+
+  airflow-init:
+
+    <<: *common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    networks:
+      - mendix-network
+    command:
+      - -c
+      - |
+        mkdir -p /sources/logs /sources/dags
+        chown -R "${AIRFLOW_UID}:0" /sources/{logs,dags}
+        exec /entrypoint airflow version
+
+  mariadb:
+    image: 'mariadb:latest'
+    hostname: mariadb
+    ports:
+      - '3306:3306'
+    environment:
+      MYSQL_ROOT_PASSWORD: admin
+      MYSQL_USER: admin
+      MYSQL_PASSWORD: admin
+      MYSQL_DATABASE: metastore_db
+    volumes:
+      - mariadb-data:/var/lib/mysql
+    networks:
+      - mendix-network
+
+  hive-metastore:
+    hostname: hive-metastore
+    image: 'bitsondatadev/hive-metastore:latest'
+    ports:
+       - '9083:9083' # Metastore Thrift
+    volumes:
+      - ./conf/metastore-site.xml:/opt/apache-hive-metastore-3.0.0-bin/conf/metastore-site.xml:ro
+      - ./libs/iceberg-hive-runtime-0.14.0.jar:/opt/apache-hive-metastore-3.0.0-bin/lib/iceberg-hive-runtime-0.14.0.jar  
+    environment:
+      METASTORE_DB_HOSTNAME: mariadb
+    depends_on:
+      - mariadb
+    networks:
+      - mendix-network
+
+  spark-iceberg:
+    image: tabulario/spark-iceberg:3.3.0_0.14.0
+    depends_on:
+    - hive-metastore
+    container_name: spark-iceberg
+    environment:
+      - AWS_ACCESS_KEY_ID=minio
+      - AWS_SECRET_ACCESS_KEY=minio123
+      - AWS_S3_ENDPOINT=http://minio:9000
+    volumes:
+      - ./notebooks:/home/iceberg/notebooks
+      - ./spark-apps:/home/iceberg/spark-apps
+      - ./conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+      - ./conf/core-site.xml:/opt/spark/conf/core-site.xml
+      - ./conf/core-default.xml:/opt/spark/conf/core-default.xml
+      - ./conf/hive-site.xml:/opt/spark/conf/hive-site.xml
+      - ./libs/hadoop-aws-3.3.4.jar:/opt/spark/jars/hadoop-aws-3.3.4.jar
+      - ./libs/hadoop-common-3.3.4.jar:/opt/spark/jars/hadoop-common-3.3.4.jar
+      - ./libs/spark-sql-kafka-0-10_2.12-3.3.0.jar:/opt/spark/jars/spark-sql-kafka-0-10_2.12-3.3.0.jar
+      - ./libs/kafka-clients-2.8.1.jar:/opt/spark/jars/kafka-clients-2.8.1.jar
+      - ./libs/jsr305-3.0.0.jar:/opt/spark/jars/jsr305-3.0.0.jar
+      - ./libs/lz4-java-1.7.1.jar:/opt/spark/jars/lz4-java-1.7.1.jar
+      - ./libs/spark-tags_2.12-3.3.0.jar:/opt/spark/jars/spark-tags_2.12-3.3.0.jar
+      - ./libs/spark-token-provider-kafka-0-10_2.12-3.3.0.jar:/opt/spark/jars/spark-token-provider-kafka-0-10_2.12-3.3.0.jar
+      - ./libs/commons-pool2-2.11.1.jar:/opt/spark/jars/commons-pool2-2.11.1.jar
+      - ./libs/commons-logging-1.1.3.jar:/opt/spark/jars/commons-logging-1.1.3.jar
+      - ./libs/aws-java-sdk-bundle-1.12.283.jar:/opt/spark/jars/aws-java-sdk-bundle-1.12.283.jar
+    ports:
+      - 8888:8888
+      - 8081:8081
+      - 18080:18080
+      - 4040:4040      
+    command: pyspark-notebook
+    networks:
+      - mendix-network
